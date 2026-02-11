@@ -13,7 +13,7 @@ app = Flask(__name__)
 # KAMERA & YOLO - Samma som förut
 # ============================================================
 
-RTSP_URL = "rtsp://service:Praktik26!@172.16.1.25:554/"
+RTSP_URL = "rtsp://service:Praktik26!@172.16.1.25:554/inst=2"
 model = YOLO("yolov8n.pt")
 model.to("cuda")
 
@@ -44,19 +44,47 @@ def create_error_frame(message, code="CAM01"):
     cv2.putText(img, message, (120, 260),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return img
-
-
 def camera_reader():
     global frame, running, last_frame_time
-    cap = cv2.VideoCapture(RTSP_URL)
+
+    cap = None
+    CONNECT_TIMEOUT = 5   # sek utan frames → reconnect
+
     while running:
+
+        # ===== CONNECT =====
+        if cap is None or not cap.isOpened():
+            print("🔄 Försöker ansluta kamera...")
+
+            cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            time.sleep(1)
+
+            if not cap.isOpened():
+                print("❌ Kunde inte ansluta kamera")
+                cap = None
+                time.sleep(2)
+                continue
+
+            print("✅ Kamera ansluten")
+            last_frame_time = time.time()
+
+        # ===== READ FRAME =====
         ret, new_frame = cap.read()
+
         if ret:
             frame = new_frame
             last_frame_time = time.time()
-        else:
-            time.sleep(0.1)
-    cap.release()
+
+        # ===== WATCHDOG =====
+        if time.time() - last_frame_time > CONNECT_TIMEOUT:
+            print("⚠️ Ingen frame mottagen → reconnectar kamera")
+
+            cap.release()
+            cap = None
+            frame = None
+            time.sleep(1)
 
 
 def extract_detections(results):
@@ -112,27 +140,39 @@ FRAME_HEIGHT = 480
 # ============================================================
 # FFmpeg tar emot råa bilder via en "pipe" (stdin)
 # och skapar H.264-kodade HLS-segment
-
 def start_ffmpeg():
-    """Startar FFmpeg som en bakgrundsprocess."""
     return subprocess.Popen([
         'ffmpeg',
-        '-y',                          # Skriv över filer
-        '-f', 'rawvideo',             # Indata är råa pixlar
-        '-vcodec', 'rawvideo',        # Ingen kodning på indata
-        '-pix_fmt', 'bgr24',          # OpenCV använder BGR-format
-        '-s', f'{FRAME_WIDTH}x{FRAME_HEIGHT}',  # Bildstorlek
-        '-r', '15',                    # 15 frames per sekund
-        '-i', '-',                     # Läs från pipe (stdin)
-        '-c:v', 'libx264',            # Koda till H.264
-        '-preset', 'ultrafast',        # Snabbast möjliga kodning
-        '-tune', 'zerolatency',        # Minimera fördröjning
-        '-g', '30',                    # Keyframe var 30:e frame
-        '-f', 'hls',                   # Output-format: HLS
-        '-hls_time', '1',             # Varje segment = 1 sekund
-        '-hls_list_size', '3',        # Behåll 3 segment i spellistan
-        '-hls_flags', 'delete_segments+temp_file',  # Rensa gamla segment
-        os.path.join(HLS_DIR, 'stream.m3u8')  # Spellistans sökväg
+        '-y',
+
+        # INPUT (OpenCV skickar rå BGR)
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-s', f'{FRAME_WIDTH}x{FRAME_HEIGHT}',
+        '-r', '10',              # Högre FPS
+        '-i', '-',
+
+        # GPU ENCODING (NVENC)
+        '-c:v', 'h264_nvenc',
+        '-preset', 'p1',         # Snabbast preset
+        '-tune', 'll',           # Low latency
+        '-rc', 'vbr',
+        '-b:v', '2M',
+
+        # ⭐ FÄRGFIX
+        '-pix_fmt', 'yuv420p',
+
+        # Keyframes
+        '-g', '10',
+
+        # HLS OUTPUT
+        '-f', 'hls',
+        '-hls_time', '1',      # Mindre latency
+        '-hls_list_size', '2',   # Mindre buffert
+        '-hls_flags', 'delete_segments+temp_file',
+
+        os.path.join(HLS_DIR, 'stream.m3u8')
     ], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
@@ -146,19 +186,32 @@ def stream_processor():
 
     ffmpeg = start_ffmpeg()
     frame_count = 0
+    TARGET_FPS = 10
+    FRAME_TIME = 1.0 / TARGET_FPS
+    last_send_time = time.time()
+
 
     while running:
         if frame is None:
-            time.sleep(0.01)
+            display = create_error_frame("Camera reconnecting...")
+            ffmpeg.stdin.write(display.tobytes())
+            time.sleep(0.1)
             continue
-
+    
         current_frame = frame.copy()
         frame_count += 1
+        start_total = time.time()
 
         # Kör YOLO var 3:e frame
-        if frame_count % 3 == 0:
+        if frame_count % 1 == 0:
+            start = time.time()
+
             results = model(current_frame, device="cuda", verbose=False)
+
+            print("YOLO inference time:", round(time.time() - start, 3), "sek")
+
             last_detections = extract_detections(results)
+            
 
         # Rita detektioner
         if time.time() - last_frame_time > 3:
@@ -168,15 +221,27 @@ def stream_processor():
 
         # Ändra storlek till det FFmpeg förväntar sig
         display = cv2.resize(display, (FRAME_WIDTH, FRAME_HEIGHT))
+       # ===== FPS pacing =====
+        now = time.time()
+        sleep_time = FRAME_TIME - (now - last_send_time)
 
-        # Skicka till FFmpeg via pipe
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+        last_send_time = time.time()
+
+# ===== Skicka till FFmpeg =====
         try:
+            start = time.time()
             ffmpeg.stdin.write(display.tobytes())
+            print("PIPE:", round(time.time() - start, 3), "sek")
+            print("TOTAL:", round(time.time() - start_total, 3), "sek")
         except BrokenPipeError:
             print("FFmpeg-pipe bröts. Startar om...")
             ffmpeg = start_ffmpeg()
 
-        time.sleep(0.01)
+      
+      
 
     ffmpeg.stdin.close()
     ffmpeg.wait()
