@@ -15,6 +15,7 @@ app = Flask(__name__)
 
 RTSP_URL = "rtsp://service:Praktik26!@172.16.1.25:554/"
 model = YOLO("yolov8n.pt")
+model.to("cuda")
 
 frame = None
 running = True
@@ -156,7 +157,7 @@ def stream_processor():
 
         # Kör YOLO var 3:e frame
         if frame_count % 3 == 0:
-            results = model(current_frame, verbose=False)
+            results = model(current_frame, device="cuda", verbose=False)
             last_detections = extract_detections(results)
 
         # Rita detektioner
