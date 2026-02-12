@@ -189,7 +189,10 @@ def stream_processor():
     TARGET_FPS = 10
     FRAME_TIME = 1.0 / TARGET_FPS
     last_send_time = time.time()
-
+    # ===== FPS-RÄKNARE =====
+    fps_counter = 0
+    fps_timer = time.time()
+    current_fps = 0.0
 
     while running:
         if frame is None:
@@ -203,7 +206,7 @@ def stream_processor():
         start_total = time.time()
 
         # Kör YOLO var 3:e frame
-        if frame_count % 1 == 0:
+        if frame_count % 3 == 0:
             start = time.time()
 
             results = model(current_frame, device="cuda", verbose=False)
@@ -221,6 +224,28 @@ def stream_processor():
 
         # Ändra storlek till det FFmpeg förväntar sig
         display = cv2.resize(display, (FRAME_WIDTH, FRAME_HEIGHT))
+          # ===== TIDSSTÄMPEL PÅ BILDEN (för latensmätning) =====
+        now_time = time.time()
+        timestamp = time.strftime("%H:%M:%S", time.localtime(now_time))
+        ms = int((now_time % 1) * 100)
+        timestamp_text = f"{timestamp}.{ms:02d}"
+        # Svart bakgrund bakom texten så den syns mot allt
+        cv2.rectangle(display, (8, 8), (220, 38), (0, 0, 0), -1)
+        cv2.putText(display, timestamp_text, (12, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        # ===== FPS-RÄKNARE (visas på bild + terminal) =====
+        fps_counter += 1
+        if now_time - fps_timer >= 1.0:
+            current_fps = fps_counter / (now_time - fps_timer)
+            print(f"📊 FPS: {current_fps:.1f}")
+            fps_counter = 0
+            fps_timer = now_time
+        # Visa FPS på bilden
+        fps_text = f"FPS: {current_fps:.1f}"
+        cv2.rectangle(display, (FRAME_WIDTH - 130, 8), (FRAME_WIDTH - 8, 38), (0, 0, 0), -1)
+        cv2.putText(display, fps_text, (FRAME_WIDTH - 126, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
        # ===== FPS pacing =====
         now = time.time()
         sleep_time = FRAME_TIME - (now - last_send_time)
